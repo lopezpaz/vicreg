@@ -41,7 +41,7 @@ def get_arguments():
     # Model
     parser.add_argument("--arch", type=str, default="resnet50",
                         help='Architecture of the backbone encoder network')
-    parser.add_argument("--mlp", default="8192-8192-8192",
+    parser.add_argument("--mlp", default="8192-8192-1000",
                         help='Size and number of layers of the MLP expander head')
 
     # Optim
@@ -92,6 +92,11 @@ def main(args):
     transforms = aug.TrainTransform()
 
     dataset = datasets.ImageFolder(args.data_dir / "train", transforms)
+
+    random_labels = torch.zeros(len(dataset)).random_(1000).long().tolist()
+    for s in range(len(dataset.samples)):
+        dataset.samples[s] = (dataset.samples[s][0], random_labels[s])
+
     sampler = torch.utils.data.distributed.DistributedSampler(dataset, shuffle=True)
     assert args.batch_size % args.world_size == 0
     per_device_batch_size = args.batch_size // args.world_size
@@ -128,15 +133,17 @@ def main(args):
     scaler = torch.cuda.amp.GradScaler()
     for epoch in range(start_epoch, args.epochs):
         sampler.set_epoch(epoch)
-        for step, ((x, y), _) in enumerate(loader, start=epoch * len(loader)):
+        for step, ((x, y), l) in enumerate(loader, start=epoch * len(loader)):
             x = x.cuda(gpu, non_blocking=True)
             y = y.cuda(gpu, non_blocking=True)
+            l = l.cuda(gpu, non_blocking=True)
 
             lr = adjust_learning_rate(args, optimizer, loader, step)
 
             optimizer.zero_grad()
             with torch.cuda.amp.autocast():
-                loss = model.forward(x, y)
+                p1, p2 = model.forward(x, y)
+                loss = 0.5 * (F.cross_entropy(p1, l) + F.cross_entropy(p2, l))
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
@@ -194,6 +201,7 @@ class VICReg(nn.Module):
     def forward(self, x, y):
         x = self.projector(self.backbone(x))
         y = self.projector(self.backbone(y))
+        return x, y
 
         repr_loss = F.mse_loss(x, y)
 
